@@ -4,7 +4,9 @@ import collections
 import sqlparse
 import pypama
 import itertools
-from typing import List, Optional, Any, Callable, Union
+from dataclasses import dataclass
+
+from typing import List, Optional, Any, Callable, Union, Iterator
 
 import re
 sqlparse.keywords.SQL_REGEX.append(
@@ -62,12 +64,16 @@ def remove(tokens: List[sqlparse.sql.Token], exclude: Callable = white):
     return [i for i in tokens if not exclude(i)]
 
 
+class QueryComponent:
+    pass
+
+
 class Visitable:
     def accept(self, visitor):
         pass
 
 
-class Table:
+class Table(QueryComponent):
     name: str
 
     def __init__(self, name: str):
@@ -86,28 +92,36 @@ class Table:
         return self.name
 
 
-class AliasedFrom:
+class AliasedFrom(QueryComponent):
     alias: Optional[str]
-    from_: Union[Table, "Query"]
+    inner_from: Union[Table, "Query"]
 
     def __init__(self, alias, from_):
         self.alias = alias
-        self.from_ = from_
+        self.inner_from = from_
 
     def get_from_(self):
-        return self.from_
+        return self.inner_from
 
     def get_alias(self):
         return self.alias
 
+    def get_exposed_name(self):
+        if self.alias:
+            return self.alias
+        if isinstance(self.inner_from, Table):
+            return self.inner_from.get_name()
+        raise SQLSyntaxError("embedded query needs an alias")
+
     def __repr__(self):
-        return f"<AF {repr(self.from_)} AS {self.alias}>"
+        return f"<AF {repr(self.inner_from)} AS {self.alias}>"
 
     def __str__(self):
         if self.alias is None:
-            return str(self.from_)
+            return str(self.inner_from)
         else:
-            return f'( {self.from_} ) AS {self.alias}'
+            return f'( {self.inner_from} ) AS {self.alias}'
+
 
 class SQLSyntaxError(Exception):
     def __init__(self, message, token, tokens=None):
@@ -151,39 +165,198 @@ def read_from(token: sqlparse.sql.Token) -> AliasedFrom:
             raise SQLSyntaxError(f"Expected Name or embedded query", token)
 
 
-class Expression:
-    def __init__(self, tokens: List[sqlparse.sql.Token]):
-        if isinstance(tokens, list):
-            self.tokens = tokens
+class BaseExpression(QueryComponent):
+
+    def accept(self, visitor):
+        getattr(visitor, 'visit' + self.__class__.__name__)
+
+
+class Expression(BaseExpression):
+    def __init__(self, items: List[Optional[BaseExpression] | 'BooleanOperator']):
+        if isinstance(items, list):
+            self.items = items
         else:
-            self.tokens = [tokens]
+            self.items = [items]
 
     def __repr__(self):
         return f"<{self.__class__.__name__} {self}>"
 
     def __str__(self):
-        return str(StrBuilder(*self.tokens))
+        result = StrBuilder()
+        for i in self.items:
+            match i:
+                case BooleanOperator():
+                    result << i
+                case x if x is not None:
+                    result << "(" << i << ")"
+        return str(result)
         # return ' '.join(str(i) for i in self.tokens)
 
-    def adapt(self, namespace):
-        pass
+
+@dataclass
+class Function(BaseExpression):
+    name: str
+    parameters: List[BaseExpression]
+
+    def __str__(self):
+        return f"{self.name}({','.join(str(i) for i in self.parameters)})"
 
 
-# def ttype_is(ttype, ttype_ancestor):
-#     while ttype:
-#         if ttype is ttype_ancestor:
-#             return True
-#         ttype = ttype.parent
-#     return False
+@dataclass
+class ColumnName(BaseExpression):
+    name: str
+    prefix: str = None
+
+    def __repr__(self):
+        return f"<ColumnName {self.prefix or ''} {repr(self.name)}>"
+
+    def __str__(self):
+        if self.prefix:
+            return f"{self.prefix}.{self.name}"
+        return self.name
 
 
-# def token_is(token, ttype):
-#     assert isinstance(token, sqlparse.sql.Token)
-#     return ttype_is(token.ttype, ttype)
+@dataclass
+class Operation(BaseExpression):
+    left: BaseExpression
+    right: BaseExpression
+    value: str
+
+    def __str__(self):
+        return f"{self.left} {self.value} {self.right}"
+
+    def __repr__(self):
+        return f"<{self.__class__.__name__} {self}>"
 
 
-def read_expression(expr: List[sqlparse.sql.Token], cls: type = Expression) -> Union[Expression, 'JoinExpression']:
-    return cls(expr)
+class Comparison(Operation):
+    pass
+
+
+@dataclass
+class JoinClause(BaseExpression):
+    left: ColumnName
+    right: ColumnName
+
+    def __str__(self):
+        res = StrBuilder() << self.left << '=' << self.right
+        return str(res)
+
+
+@dataclass
+class Literal(BaseExpression):
+    value: str
+    ttype: sqlparse.tokens._TokenType
+
+    def __str__(self):
+        return repr(self.value)[1:-1]
+
+    def __repr__(self):
+        return f"<Literal {self.value}>"
+
+
+@dataclass
+class BooleanOperator:
+    value: str
+
+    def __str__(self):
+        return self.value
+
+
+BOOLEAN_OP_PATTERN = pypama.build_pattern((K.AND | K.OR | K.NOT).capture())
+
+
+def read_parameter_list(token: sqlparse.sql.Identifier) -> List[BaseExpression]:
+    if token is None:
+        return None
+    result = []
+    for identifier in token.get_identifiers():
+        match identifier:
+            case sqlparse.sql.Identifier():
+                r = read_aliased_expression(identifier)
+                assert r.get_alias() is None
+                result.append(r.get_expression())
+            case sqlparse.sql.Function() | sqlparse.sql.Operation() | sqlparse.sql.Comparison():
+                result.append(read_expression([identifier]))
+            case sqlparse.sql.Token() if T.String.Single(identifier) or T.Literal(identifier):
+                result.append(read_expression([identifier]))
+            case _:
+                raise SQLSyntaxError(
+                    "Expected identifier or expression", identifier)
+    return result
+
+
+def get_function_parameters(tokens):
+    match tokens:
+        case [
+            sqlparse.sql.Token() as p1,
+            sqlparse.sql.IdentifierList() as il,
+            sqlparse.sql.Token() as p2
+        ] if T.Punctuation(p1) and T.Punctuation(p2):
+            return read_parameter_list(il)
+        case [
+            sqlparse.sql.Token() as p1,
+            (sqlparse.sql.Identifier() | sqlparse.sql.Operation() | sqlparse.sql.Function()) as expr,
+            sqlparse.sql.Token() as p2
+        ] if T.Punctuation(p1) and T.Punctuation(p2):
+            return [read_expression([expr])]
+    raise ValueError(tokens)
+
+    # it = iter(tokens)
+    # result = []
+    # for punctuation, token in itertools.zip_longest(it, it):
+    #     assert T.Punctuation(punctuation), ValueError()
+    #     match token:
+    #         case I.Identifier:
+    #             result.append(read_expression(unpack_identifier(token)[1:]))
+    #         case x if x is not None:
+    #             result.append(read_expression([token]))
+    # return result
+
+
+def read_expression(expr: List[sqlparse.sql.Token], cls: type = Expression) -> BaseExpression:
+    match expr:
+        case [sqlparse.sql.Function() as fun]:
+            return Function(fun.get_real_name(), get_function_parameters(remove(fun.tokens)[-1].tokens))
+        case [sqlparse.sql.Token() as token_name] if T.Name(token_name):
+            return ColumnName(token_name.value)
+        case [sqlparse.sql.Token() as token_lit] if T.Literal(token_lit) or T.String(token_lit):
+            return Literal(token_lit.value, token_lit.ttype)
+        case [sqlparse.sql.Identifier() as identifier]:
+            aliased_expression = read_aliased_expression(identifier)
+            assert aliased_expression.get_alias() is None
+            return aliased_expression.get_expression()
+        case [sqlparse.sql.Operation()]:
+            left, op, right = pypama.build_pattern(
+                T.Operator.capture()).split(remove(expr[0].tokens))
+            return Operation(read_expression(left), read_expression(right), op[0].value)
+        case [sqlparse.sql.Parenthesis(tokens=t)]:
+            return read_expression(remove(t)[1:-1])
+        case [sqlparse.sql.Comparison()]:
+            left, op, right = pypama.build_pattern(
+                T.Operator.capture()).split(remove(expr[0].tokens))
+            return Comparison(read_expression(left), read_expression(right), op[0].value)
+        case _:
+            assert len(expr) > 1
+            s = iter(BOOLEAN_OP_PATTERN.split(expr))
+            result = []
+            for t, k in itertools.zip_longest(s, s):
+                assert len(t) <= 1
+                result.append(read_expression([t[0]]) if t else None)
+                if k is None:
+                    continue
+                assert len(k) == 1
+                result.append(BooleanOperator(k[0].value))
+            return Expression(result)
+
+
+def read_join_expression(expr: List[sqlparse.sql.Token]):
+    match read_expression(expr):
+        case Comparison(left=ColumnName() as left, right=ColumnName() as right, value='='):
+            return JoinClause(left, right)
+        case _:
+            raise ValueError()
+
     # match expr:
     #     case sqlparse.sql.Token() if expr.value == 'Name':
     #             return Expression(expr)
@@ -195,43 +368,32 @@ def read_expression(expr: List[sqlparse.sql.Token], cls: type = Expression) -> U
     #         raise ValueError()
 
 
-class JoinExpression(Expression):
-    pass
-
-
-def read_join_expression(expr: sqlparse.sql.Token):
-    return read_expression(expr, JoinExpression)
-
-
-JOIN_PATTERN = pypama.build_pattern(
-    (T.Keyword & F(lambda t: 'join' in t.value.lower())).capture()
-)
+# class JoinExpression(Expression):
+#     pass
 
 
 def unpack_identifier(identifier: sqlparse.sql.Identifier):
     match remove(identifier.tokens, white):
         case [expr, sqlparse.sql.Token() as token_as, alias] if K.AS(token_as):
             return alias.get_name(), expr
-        case [sqlparse.sql.Token() as token_name] if K.Name(token_name):
-            return token_name.value, token_name
+        case [sqlparse.sql.Token() as token_name] if T.Name(token_name):
+            return None, token_name
         case [value]:
             return None, value
         case _:
             raise ValueError("Expected name [AS alias]")
 
 
-class Join:
-    def __init__(
-        self,
-        from_: AliasedFrom,
-        on_: JoinExpression = None,
-        join: Optional[str] = None
-    ):
-        assert isinstance(from_, AliasedFrom)
-        assert on_ is None or isinstance(on_, Expression)
-        self.from_ = from_
+@dataclass
+class Join(QueryComponent):
+    aliased_from: AliasedFrom
+    on_: JoinClause = None
+    join_type: Optional[str] = None
+
+    def __init__(self, from_: AliasedFrom, on_: Optional[JoinClause], join_type: Optional[str]):
+        self.aliased_from = from_
         self.on_ = on_
-        self.join = join
+        self.join_type = join_type
 
     def __repr__(self):
         q = StrBuilder()
@@ -244,34 +406,59 @@ class Join:
         self.to_builder(res)
         return str(res)
 
+    def get_aliased_from(self) -> AliasedFrom:
+        return self.aliased_from
+
     def to_builder(self, result):
-        result << self.from_
+        result << self.join_type << self.aliased_from
         result << (self.on_ and StrBuilder('ON', self.on_))
-        result << StrBuilder(self.join)
         return result
 
 
-class Joins:
-    join_list: str
-
-    def __init__(self, join_list: List[Join]):
-        self.join_list = join_list
+class Joins(list, QueryComponent):
 
     def __str__(self):
-        return ' '.join(str(i) for i in self.join_list)
+        return ' '.join(str(i) for i in self)
 
     def __repr__(self):
-        return ' '.join(map(repr, self.join_list))
+        return ' '.join(map(repr, self))
+
+    def get_name(self):
+        match self:
+            case [Join(AliasedFrom() as af)]:
+                return af.get_exposed_name()
+            case _:
+                raise NotImplementedError()
+
+
+_ARRAY_JOIN_PATTERN = pypama.S([
+    T.Name.Builtin & F(lambda t: t.value.lower() == 'array'),
+    T.Keyword & F(lambda t: 'join' in t.value.lower()),
+    (I.Identifier.capture('array_join'))]
+)
+
+_JOIN_TOKEN = (T.Keyword & F(lambda t: 'join' in t.value.lower()))
+JOIN_TOKEN = pypama.build_pattern(_JOIN_TOKEN.capture())
+
+_JOIN_CLAUSE_PATTERN = pypama.S([
+    _JOIN_TOKEN.capture('join_token'),
+    (I.Parenthesis | I.Identifier).capture('join_with'),
+    (K.ON + (I.Parenthesis | I.Comparison).capture('join_clause')).opt()
+])
+FULL_JOIN_CLAUSE_PATTERN = pypama.Pattern.make(
+    _JOIN_CLAUSE_PATTERN | _ARRAY_JOIN_PATTERN)
+
 
 
 def read_join(tokens) -> Joins:
-    seq = list(JOIN_PATTERN.split(remove(tokens, white)))
-    results = []
-    it = iter(seq)
-    for select_on_tokens, join in itertools.zip_longest(it, it):
+    seq = list(FULL_JOIN_CLAUSE_PATTERN.find_groupdict(remove(tokens, white)))
+    # seq = JOIN_TOKEN.split(remove(tokens))
+    results = Joins()
+    it = iter([None, *seq])
+    for join, select_on_tokens in itertools.zip_longest(it, it):
         if join is not None:
-            assert (I.Token(join[0]) and 'join' in join[0].value.lower())
-            join = join[0].value
+            assert (I.Token(join[-1]) and 'join' in join[-1].value.lower())
+            join = ' '.join(map(str, join))
         match select_on_tokens:
             # case [sqlparse.sql.Identifier() as identifier]:
             #     # alias, from_ = unpack_identifier(identifier)
@@ -285,33 +472,27 @@ def read_join(tokens) -> Joins:
                 select_from = read_from(from_)
                 results.append(Join(select_from, None, join))
             case _:
-                raise SQLSyntaxError("Expected token [ON on clause]", select_on_tokens)
-    return Joins(results)
+                raise SQLSyntaxError(
+                    "Expected token [ON on clause]", select_on_tokens)
+    return results
 
 
-class Column(Expression):
-    name: str
-
-    def __init__(self, name: str):
-        self.name = name
-
-    def __repr__(self):
-        return f"<Column {repr(self.name)}>"
-
-    def __str__(self):
-        return self.name
-
-
-class AliasedExpression:
-    expression: Expression
+class AliasedExpression(QueryComponent):
+    expression: BaseExpression
     alias: Optional[str]
 
-    def __init__(self, alias: Optional[str], expression: Expression):
+    def __init__(self, alias: Optional[str], expression: BaseExpression):
         self.expression = expression
         self.alias = alias
 
     def get_alias(self):
         return self.alias
+
+    def get_expression(self):
+        return self.expression
+
+    def __iter__(self):
+        return iter([self.alias, self.expression])
 
     def __repr__(self):
         return f"<AE {repr(self.expression)} AS {self.alias}>"
@@ -322,25 +503,46 @@ class AliasedExpression:
         return f'{self.expression} AS {self.alias}'
 
 
+ALIASED_EXPRESSION_PATTERN = pypama.build_pattern(
+    '(', (T.Name).capture('prefix'),
+    T.Punctuation,
+    ') ?',
+    T.Name.capture('name') | (I.Function | I.Operation |
+                              I.Comparison).capture('expr'),
+    '(', K.AS,
+    I.Identifier.capture('alias'), ')?'
+)
+
+
 def read_aliased_expression(token: sqlparse.sql.Token) -> AliasedExpression:
     assert I.Identifier(token)
     tokens = token.tokens
-    match remove(tokens, white):
-        case [expr, _as, alias] if K.AS(_as):
-            return AliasedExpression(alias.get_name(), Expression([expr]))
-        case [name] if T.Name(name):
-            return AliasedExpression(name.value, Column(name.value))
+    m = ALIASED_EXPRESSION_PATTERN.match(remove(tokens))
+    if not m:
+        raise ValueError()
+    d = m.groupdict()
+    alias = token.get_alias()
+    match d:
+        case {'name': [name], 'prefix': [prefix]}:
+            return AliasedExpression(alias, ColumnName(name.value, prefix.value))
+        case {'name': [name]}:
+            return AliasedExpression(alias, ColumnName(name.value))
+        case {'expr': expr}:
+            return AliasedExpression(token.get_alias(), read_expression(expr))
         case _:
-            raise SQLSyntaxError("Expected value [AS alias]", token)
+            raise ValueError()
 
 
-class AliasedExpressionList:
+class AliasedExpressionList(QueryComponent):
     identifier_list: List[AliasedExpression]
 
     # list of Identifier
     def __init__(self, identifier_list: List[AliasedExpression]):
         assert all(isinstance(i, AliasedExpression) for i in identifier_list)
         self.identifier_list = identifier_list
+
+    def __iter__(self):
+        return iter(self.identifier_list)
 
     def __repr__(self):
         return f"<AEList {repr(self.identifier_list)}>"
@@ -349,7 +551,7 @@ class AliasedExpressionList:
         return ', '.join(str(i) for i in self.identifier_list)
 
 
-class Wildcard(AliasedExpressionList):
+class Wildcard(BaseExpression):
     def __init__(self):
         pass
 
@@ -369,18 +571,26 @@ def read_identifier_list(token: Optional[sqlparse.sql.Token]) -> Optional[Aliase
             case sqlparse.sql.Identifier():
                 result.append(read_aliased_expression(identifier))
             case sqlparse.sql.Function() | sqlparse.sql.Operation() | sqlparse.sql.Comparison():
-                result.append(Expression(identifier))
+                result.append(AliasedExpression(
+                    None, read_expression([identifier])))
+            case sqlparse.sql.Token() if T.String.Single(identifier) or T.Literal(identifier):
+                result.append(AliasedExpression(
+                    None, read_expression([identifier])))
             case _:
-                raise SQLSyntaxError("Expected identifier or expression")
+                raise SQLSyntaxError(
+                    "Expected identifier or expression", identifier)
     return AliasedExpressionList(result)
 
 
-class ExpressionList:
-    expression_list: List[Expression]
+class ExpressionList(QueryComponent):
+    expression_list: List[BaseExpression]
 
-    def __init__(self, expression_list: List[Expression]):
+    def __init__(self, expression_list: List[BaseExpression]):
         self.expression_list = expression_list
-        assert all(isinstance(i, Expression) for i in expression_list)
+        assert all(isinstance(i, BaseExpression) for i in expression_list)
+
+    def __iter__(self):
+        return iter(self.expression_list)
 
     def __str__(self):
         return ', '.join(str(i) for i in self.expression_list)
@@ -398,22 +608,28 @@ def read_expression_list(tokens: List[sqlparse.sql.Token]) -> ExpressionList:
         match token:
             case sqlparse.sql.Identifier():
                 assert token.get_alias() is None
-                result.append(Expression([token]))
+                result.append(read_expression([token]))
             case sqlparse.sql.Function() | sqlparse.sql.Operation() | sqlparse.sql.Comparison():
-                result.append(Expression([token]))
+                result.append(read_expression([token]))
+            case sqlparse.sql.Token() if T.Literal.Number.Integer(token):
+                result.append(Literal(token.value, token.ttype))
             case _:
-                raise SQLSyntaxError("Expected identifier or expression", token)
+                raise SQLSyntaxError(
+                    "Expected identifier or expression", token)
     if not result:
         return None
     else:
         return ExpressionList(result)
 
 
-class Select:
+class Select(QueryComponent):
     aelist: AliasedExpressionList
 
     def __init__(self, aelist: AliasedExpressionList):
         self.aelist = aelist
+
+    def __iter__(self):
+        return iter(self.aelist)
 
     def __repr__(self):
         return f"<Select {self.aelist}>"
@@ -430,10 +646,10 @@ def read_select(token: sqlparse.sql.Token) -> Select:
             return Select(read_identifier_list(token))
         case sqlparse.sql.Identifier():
             return Select(AliasedExpressionList([read_aliased_expression(token)]))
-        # case sqlparse.sql.Function() | sqlparse.sql.Operation():
-        #     return {None: token}
+        case sqlparse.sql.Function() | sqlparse.sql.Operation():
+            return Select(AliasedExpressionList([AliasedExpression(None, read_expression([token]))]))
         case sqlparse.sql.Token() if T.Wildcard(token):
-            return Select(Wildcard())
+            return Select(AliasedExpressionList([AliasedExpression(None, Wildcard())]))
         case _:
             raise ValueError(token)
 
@@ -453,20 +669,18 @@ def read_where(token: List[sqlparse.sql.Token]) -> Expression:
 QUERY_PATTERN = pypama.build_pattern(
     T.Keyword.DML,
     T.Keyword.DISTINCT.opt().capture('DISTINCT'),
-    (I.IdentifierList | I.Identifier | T.Wildcard).capture('SELECT'),
+    (I.IdentifierList | I.Identifier | T.Wildcard |
+     I.Function | I.Comparison | I.Operation).star().capture('SELECT'),
     K.FROM,
     (
         (I.Parenthesis | I.Identifier)
-        + (
-            (T.Keyword & F(lambda t: 'join' in t.value.lower()))
-            + (I.Parenthesis | I.Identifier)
-            + (K.ON + (I.Parenthesis | I.Comparison)).opt()
-        ).star()
+        + (_JOIN_CLAUSE_PATTERN | _ARRAY_JOIN_PATTERN).star()
     ).capture('FROM'),
     I.Where.opt().capture('WHERE'),
-    (K['GROUP BY'] + (I.IdentifierList | I.Identifier).capture('GROUPBY')).opt(),
+    (K['GROUP BY'] + (I.IdentifierList | I.Identifier | I.Function |
+     I.Comparison | I.Operation | T.Literal.Number).capture('GROUPBY')).opt(),
     I.Having.opt().capture('HAVING'),
-    (K['ORDER BY'] + (I.IdentifierList | I.Identifier).capture('ORDERBY')
+    (K['ORDER BY'] + (I.IdentifierList | I.Identifier | T.Literal.Number).capture('ORDERBY')
      ).opt().capture('ORDERBY'),
     (K.Limit + T.Literal.Number.capture('LIMIT')).opt(),
     '$',
@@ -502,8 +716,18 @@ class StrBuilder:
         return ' '.join((i if isinstance(i, str) else repr(i)) for i in self.buffer if i is not None)
 
 
-class Query:
-    def __init__(self,  select, from_, distinct=False, where=None, groupby=None, orderby=None, having=None, limit=None):
+class Query(QueryComponent):
+    def __init__(
+        self,
+        select: Optional[Select],
+        from_: Optional[Joins],
+        distinct: bool = False,
+        where: Optional[BaseExpression] = None,
+        groupby: Optional[ExpressionList] = None,
+        orderby: Optional[ExpressionList] = None,
+        having: Optional[ExpressionList] = None,
+        limit: Optional[Literal] = None
+    ):
         self.select = select
         self.from_ = from_
         self.distinct = distinct
@@ -513,7 +737,19 @@ class Query:
         self.having = having
         self.limit = limit
 
-    def get_name(self) -> Optional[str]:
+    def sub_queries(self) -> Iterator[AliasedFrom]:
+        for join in self.from_:
+            match join:
+                case Join(aliased_from=AliasedFrom(inner_from=Table())):
+                    pass
+                case Join(aliased_from=AliasedFrom(inner_from=Query() as q) as af):
+                    # yield from q.sub_queries()
+                    yield af
+
+    def get_frame_name(self) -> Optional[str]:
+        return self.from_.get_name()
+
+    def get_name(self):
         return None
 
     def to_str_builder(self, builder: StrBuilder) -> StrBuilder:
@@ -539,7 +775,9 @@ class Query:
 
 def read_query(tokens: List[sqlparse.sql.Token]) -> Query:
     seq = remove(tokens, white)
+
     res = QUERY_PATTERN.match(seq)
+
     if not res:
         raise ValueError(seq)
     else:
@@ -612,3 +850,16 @@ for name, fun in list(globals().items()):
 #             print('ERROR')
 #             for i in seq:print(i)
 #             raise ValueError(res)
+
+
+# def ttype_is(ttype, ttype_ancestor):
+#     while ttype:
+#         if ttype is ttype_ancestor:
+#             return True
+#         ttype = ttype.parent
+#     return False
+
+
+# def token_is(token, ttype):
+#     assert isinstance(token, sqlparse.sql.Token)
+#     return ttype_is(token.ttype, ttype)
