@@ -93,12 +93,12 @@ QUERIES2 = [
     (
         """select * from 
             (select town, list(height) as height_range from df group by 1) as dflist
-            array join dflist.height_range as height""",
-        [['Lyon',  [165, 162, 184], 165],
-         ['Lyon',  [165, 162, 184], 162],
-         ['Lyon',  [165, 162, 184], 184],
-         ['Paris', [182, 190], 182],
-         ['Paris', [182, 190], 190]
+            array join dflist.height_range""",
+        [['Lyon',  165],
+         ['Lyon',  162],
+         ['Lyon',  184],
+         ['Paris', 182],
+         ['Paris', 190]
          ]
 
     )

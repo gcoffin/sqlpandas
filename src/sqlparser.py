@@ -302,17 +302,6 @@ def get_function_parameters(tokens):
             return [read_expression([expr])]
     raise ValueError(tokens)
 
-    # it = iter(tokens)
-    # result = []
-    # for punctuation, token in itertools.zip_longest(it, it):
-    #     assert T.Punctuation(punctuation), ValueError()
-    #     match token:
-    #         case I.Identifier:
-    #             result.append(read_expression(unpack_identifier(token)[1:]))
-    #         case x if x is not None:
-    #             result.append(read_expression([token]))
-    # return result
-
 
 def read_expression(expr: List[sqlparse.sql.Token], cls: type = Expression) -> BaseExpression:
     match expr:
@@ -356,20 +345,6 @@ def read_join_expression(expr: List[sqlparse.sql.Token]):
             return JoinClause(left, right)
         case _:
             raise ValueError()
-
-    # match expr:
-    #     case sqlparse.sql.Token() if expr.value == 'Name':
-    #             return Expression(expr)
-    #     case sqlparse.sql.Token() if token_is(expr, sqlparse.tokens.Token.Literal):
-    #             return Expression(expr)
-    #     case sqlparse.sql.Function() | sqlparse.sql.Operation() | sqlparse.sql.Comparison():
-    #         return Expression(expr)
-    #     case _:
-    #         raise ValueError()
-
-
-# class JoinExpression(Expression):
-#     pass
 
 
 def unpack_identifier(identifier: sqlparse.sql.Identifier):
@@ -436,25 +411,32 @@ _ARRAY_JOIN_PATTERN = pypama.S([
     T.Keyword & F(lambda t: 'join' in t.value.lower()),
     (I.Identifier.capture('array_join'))]
 )
+ARRAY_JOIN_PATTERN = pypama.Pattern.make(_ARRAY_JOIN_PATTERN)
 
 _JOIN_TOKEN = (T.Keyword & F(lambda t: 'join' in t.value.lower()))
-JOIN_TOKEN = pypama.build_pattern(_JOIN_TOKEN.capture())
+JOIN_TOKEN = pypama.Pattern.make(_JOIN_TOKEN.capture())
 
 _JOIN_CLAUSE_PATTERN = pypama.S([
     _JOIN_TOKEN.capture('join_token'),
     (I.Parenthesis | I.Identifier).capture('join_with'),
     (K.ON + (I.Parenthesis | I.Comparison).capture('join_clause')).opt()
 ])
-FULL_JOIN_CLAUSE_PATTERN = pypama.Pattern.make(
-    _JOIN_CLAUSE_PATTERN | _ARRAY_JOIN_PATTERN)
 
 
+def read_array_joins(tokens) -> List[BaseExpression]:
+    result = []
+    if tokens:
+        for i in ARRAY_JOIN_PATTERN.find_groupdict(remove(tokens)):
+            t = i['array_join']
+            result.append(read_expression(t))
+    return result
 
-def read_join(tokens) -> Joins:
-    seq = list(FULL_JOIN_CLAUSE_PATTERN.find_groupdict(remove(tokens, white)))
-    # seq = JOIN_TOKEN.split(remove(tokens))
+
+def read_join(from_tokens, joins_tokens) -> Joins:
+    seq = JOIN_TOKEN.split(remove(joins_tokens))
+    assert not next(seq)
     results = Joins()
-    it = iter([None, *seq])
+    it = iter([None, from_tokens, *seq])
     for join, select_on_tokens in itertools.zip_longest(it, it):
         if join is not None:
             assert (I.Token(join[-1]) and 'join' in join[-1].value.lower())
@@ -672,10 +654,11 @@ QUERY_PATTERN = pypama.build_pattern(
     (I.IdentifierList | I.Identifier | T.Wildcard |
      I.Function | I.Comparison | I.Operation).star().capture('SELECT'),
     K.FROM,
-    (
-        (I.Parenthesis | I.Identifier)
-        + (_JOIN_CLAUSE_PATTERN | _ARRAY_JOIN_PATTERN).star()
-    ).capture('FROM'),
+    pypama.S([
+        (I.Parenthesis | I.Identifier).capture('FROM'),
+        _ARRAY_JOIN_PATTERN.star().capture('ARRAYJOINS'),
+        _JOIN_CLAUSE_PATTERN.star().capture('JOINS')]
+    ),
     I.Where.opt().capture('WHERE'),
     (K['GROUP BY'] + (I.IdentifierList | I.Identifier | I.Function |
      I.Comparison | I.Operation | T.Literal.Number).capture('GROUPBY')).opt(),
@@ -721,6 +704,7 @@ class Query(QueryComponent):
         self,
         select: Optional[Select],
         from_: Optional[Joins],
+        array_joins: Optional[List[BaseExpression]] = None,
         distinct: bool = False,
         where: Optional[BaseExpression] = None,
         groupby: Optional[ExpressionList] = None,
@@ -730,6 +714,7 @@ class Query(QueryComponent):
     ):
         self.select = select
         self.from_ = from_
+        self.array_joins = array_joins
         self.distinct = distinct
         self.where = where
         self.groupby = groupby
@@ -784,7 +769,8 @@ def read_query(tokens: List[sqlparse.sql.Token]) -> Query:
         vars = res.groupdict()
         return Query(
             read_select(vars['SELECT'][0]),
-            read_join(vars['FROM']),
+            read_join(vars['FROM'], vars['JOINS']),
+            read_array_joins(vars['ARRAYJOINS']),
             bool(vars.get('DISTINCT', False)),
             read_where(vars.get('WHERE')),
             read_expression_list(vars.get('GROUPBY')),
@@ -806,60 +792,3 @@ for name, fun in list(globals().items()):
         continue
     if isinstance(fun, type) or callable(fun):
         fun = typeguard.typechecked(fun)
-
-
-# FROM_PATTERN = pypama.build_pattern(
-#         I.Identifier.capture('identifier') |
-#         (T.Keyword.DML + pypama.ANY.star()).capture('select') | #should be SELECT
-#         T.Name.capture('table') |
-#         (I.Parenthesis.capture('parenthesis'))
-#         # (K.AS + I.Identifier.capture('alias')).opt()
-#     )
-
-
-# def merge_dicts(dctlist):
-#     idx = 0
-#     res = {}
-#     for d in dctlist:
-#         for k,v in d.items():
-#             if k is None:
-#                 k = f"_col{idx}"
-#                 idx += 1
-#             assert not k in res
-#             res[k] = v
-#     return res
-
-
-# class Item:
-#     def __init__(self, **dct):
-#         self.data = dct
-
-#     def __getattr__(self, name):
-#         return self.data.get(name)
-
-#     def __repr__(self):
-#         return f"<{self.__class__.__name__} {self.data}>"
-
-#     @classmethod
-#     def make(cls, tokens):
-#         seq = remove(tokens, white)
-#         res = cls.pattern.match(seq)
-#         if res:
-#             return cls(**res.groupdict())
-#         else:
-#             print('ERROR')
-#             for i in seq:print(i)
-#             raise ValueError(res)
-
-
-# def ttype_is(ttype, ttype_ancestor):
-#     while ttype:
-#         if ttype is ttype_ancestor:
-#             return True
-#         ttype = ttype.parent
-#     return False
-
-
-# def token_is(token, ttype):
-#     assert isinstance(token, sqlparse.sql.Token)
-#     return ttype_is(token.ttype, ttype)

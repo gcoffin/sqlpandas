@@ -53,10 +53,10 @@ def make_coalesce(df, p):
 
 # TODO: add list and other non predefined function (eg list)
 AGGR_FUNCTIONS = {
-    'sum': ("'sum'",'sum'), 
-    'count': ("'count'",'count'),
-    'avg': ("'mean'",'mean'),
-    'list': ("list",'list')
+    'sum': ("'sum'", 'sum'),
+    'count': ("'count'", 'count'),
+    'avg': ("'mean'", 'mean'),
+    'list': ("list", 'list')
 }
 
 CONV_FUNCTION = {
@@ -78,8 +78,6 @@ class Code:
 
     def __repr__(self):
         return repr(self.code)
-
-
 
 
 class ExpressionAndAlias(BaseExpression):
@@ -110,7 +108,7 @@ JOIN_TYPES = {
     'inner': 'inner',
     'left join': 'left',
     'right join': 'right',
-    'cross join': 'cross' 
+    'cross join': 'cross'
 }
 
 
@@ -180,7 +178,8 @@ class JoinDataFrame(AbstractDataFrame):
         return self.variable_name
 
     def generate_cross_join(self, code):
-        code << "pd.merge(" << self.df1.get_frame_variable() << '.assign(__crossjoin=0),'
+        code << "pd.merge(" << self.df1.get_frame_variable(
+        ) << '.assign(__crossjoin=0),'
         code << self.df2.get_frame_variable() << '.assign(__crossjoin=0),'
         code << f'left_on="__crossjoin",'
         code << f'right_on="__crossjoin",'
@@ -190,9 +189,6 @@ class JoinDataFrame(AbstractDataFrame):
     def generate_code_body(self, code):
         if self.jointype == 'cross':
             return self.generate_cross_join(code)
-        elif self.jointype == 'array':
-            # TODO: implement with pd.DataFrame.explode
-            raise NotImplementedError()
         else:
             assert self.join_clause is not None, ValueError('no join clause')
             code << "pd.merge(" << self.df1.get_frame_variable() << ","
@@ -222,7 +218,8 @@ class SimpleDataFrame(AbstractDataFrame):
 
 
 NL = '\n'
-IDENT = '    '
+INDENT = '    '
+
 
 class DataFrame(AbstractDataFrame):
     select: List[ExpressionAndAlias]
@@ -243,6 +240,7 @@ class DataFrame(AbstractDataFrame):
         self.groupby = []
         self.orderby = []
         self.limit = None
+        self.array_joins = []
         self.renames = {}
         self.select = []
         self.aggr = {}
@@ -258,11 +256,18 @@ class DataFrame(AbstractDataFrame):
         return f"{self.from_.get_frame_variable()}['{self.from_.render_column_name(column_name)}']"
 
     def render_column_name(self, col):
-        return self.col.name
+        return col.name
 
     def add_where(self, where):
         if where:
-            self.where = self.render(where)
+            self.where = where
+
+    def add_array_joins(self, array_joins: Optional[List[BaseExpression]]):
+        if array_joins:
+            self.array_joins = []
+            for aj in array_joins:
+                assert isinstance(aj, ColumnName)
+                self.array_joins.append(aj)
 
     def create_name(self, expr: BaseExpression) -> str:
         r = create_unique(str(expr), self.namespace)
@@ -356,17 +361,23 @@ class DataFrame(AbstractDataFrame):
             code << '.assign('
             for col, exp in self.materialized:
                 code << col << "= lambda _df:("
-                code << SimpleDataFrame('_df').render(exp) << ')' << NL << IDENT
-            code << ")" << NL << IDENT
+                code << SimpleDataFrame('_df').render(
+                    exp) << ')' << NL << INDENT
+            code << ")" << NL << INDENT
+        if self.array_joins:
+            for aj in self.array_joins:
+                code << ".explode('" << self.render_column_name(
+                    aj) << "')" << NL << INDENT
         if self.where:
-            code << f'.pipe(lambda _df: _df[{self.where}])' << NL << IDENT
+            code << f'.pipe(lambda _df: _df[{self.render(self.where)}])' << NL << INDENT
         if self.groupby:
             code << ".groupby("
             code << ','.join(f"'{self.render_name(i)}'" for i in self.groupby)
-            code << ',as_index=False)' << NL << IDENT
+            code << ',as_index=False)' << NL << INDENT
         if self.aggr:
-            aggr = ','.join(f"'{k}':[{','.join(map(str,v))}]" for k, v in self.aggr.items())
-            code << ".aggregate({" << aggr << '})' << NL << IDENT
+            aggr = ','.join(
+                f"'{k}':[{','.join(map(str,v))}]" for k, v in self.aggr.items())
+            code << ".aggregate({" << aggr << '})' << NL << INDENT
             if not self.groupby:
                 # pandas return a table column/func instead of a multi-index. Sort that:
                 code << (
@@ -374,9 +385,9 @@ class DataFrame(AbstractDataFrame):
                     "data=ag.values.reshape((1,-1)), "
                     "columns=pd.MultiIndex.from_product([ag.columns, ag.index]))"
                     ".dropna(axis='columns'))"
-                ) << NL << IDENT
+                ) << NL << INDENT
             code << ".pipe(lambda df: df.set_axis(['_'.join(i for i in x if i) for x in df.columns], axis='columns'))"
-            code << NL << IDENT
+            code << NL << INDENT
         if self.select and not (len(self.select) == 1 and self.select[0] == Wildcard()):
             code << '.pipe(lambda _df: _df[['
             for ae in self.select:
@@ -384,13 +395,13 @@ class DataFrame(AbstractDataFrame):
                     code << ']+ list(_df.columns) + ['
                 else:
                     code << f"'{self.render_name(ae.get_exposed_name())}'" << ','
-            code << ']])' << NL << IDENT
+            code << ']])' << NL << INDENT
         if self.renames:
-            code << f'.rename({self.renames}, axis="columns")' << NL << IDENT
+            code << f'.rename({self.renames}, axis="columns")' << NL << INDENT
         if self.orderby:
             code << ".sort_values("
             code << ','.join(f"'{self.render_name(i)}'" for i in self.orderby)
-            code << ')' << NL << IDENT
+            code << ')' << NL << INDENT
         if self.limit:
             code << f".iloc[:{self.render(self.limit)}]"
         code << ')'
@@ -408,6 +419,7 @@ def make_dataframe(query: Query, from_: AbstractDataFrame):
         df.add_orderby(query.orderby)
         df.add_limit(query.limit)
         df.add_where(query.where)
+        df.add_array_joins(query.array_joins)
     else:
         df = query
     return df
@@ -417,9 +429,6 @@ def _code_gen(pq: Query, code: Code, exposed_name, namespace) -> AbstractDataFra
 
     for af in pq.sub_queries():
         _code_gen(af.get_from_(), code, af.get_exposed_name(), namespace)
-        # code << af.get_alias() << '='
-        # namespace.add(af.get_alias())
-        # df.generate_code_body(code) << NL
     af = SimpleDataFrame(pq.from_[0].get_aliased_from().get_exposed_name())
     frame = make_dataframe(af.get_from_(), af.get_alias())
     for i, join in enumerate(pq.from_[1:]):  # create the joins
@@ -440,28 +449,6 @@ def code_gen(query: str, code: Code, exposed_name: str):
     namespace = set([exposed_name])
     pq = parse_query(query)
     return _code_gen(pq, code, exposed_name, namespace)
-
-
-# def code_gen(query: Query, code: Code, exposed_name) -> DataFrame:
-#     namespace = set([exposed_name])
-#     pq = parse_query(query)
-#     for af in pq.sub_queries():
-#         df = make_dataframe(af.get_from_(), SimpleDataFrame(af.get_from_().get_alias()))
-#         code << af.get_alias() << '='
-#         namespace.add(af.get_alias())
-#         df.generate_code_body(code) << NL
-#     af = SimpleDataFrame(pq.from_[0].from_.get_name())
-#     frame = make_dataframe(af.get_from_(), af.get_alias())
-#     for i, join in enumerate(pq.from_[1:]):
-#         af = SimpleDataFrame(join.from_.get_alias())
-#         f = make_dataframe(af.get_from_(), af.get_alias())
-#         frame_name = create_unique('join_df', namespace)
-#         frame = JoinDataFrame(frame_name, frame, f, join.on_, join.join_type)
-#         code << NL << frame_name << '='
-#         frame.generate_code_body(code)
-#     code << NL << exposed_name << '='
-#     make_dataframe(pq, frame).generate_code_body(code)
-#     return code
 
 
 for name, fun in list(globals().items()):
