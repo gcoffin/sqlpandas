@@ -1,7 +1,9 @@
+import sys
 import math
-from sqldf import parse_query, Code, DataFrame, code_gen
 import numpy as np
 import pytest
+
+from sqldf import parse_query, Code, DataFrame, code_gen
 
 HEADER = ['id', 'name', 'gender', 'height', 'town']
 DATA = [
@@ -37,6 +39,7 @@ resql = pd.read_sql('''{q}''', con=con)
 
 QUERIES = [
     """select df.height, coalesce(df.name,'-') from df""",
+    """select distinct town from df""",
     """select df.id as a from df""",
     """select count(height) from df""",
     """select town, avg(height) from df where gender='M' and not name='Paulette' group by town""",
@@ -145,9 +148,10 @@ def test_query2(q, data):
 
 
 if __name__ == "__main__":
-    if 0:
+    import instrument
+    if 1:
         for q in QUERIES:
             test_query(q)
-    else:
+    if 1:
         for q in QUERIES2:
             test_query2(*q)

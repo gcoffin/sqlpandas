@@ -1,16 +1,12 @@
-import typeguard
-import abc
 import re
-import itertools
-import sqlparse
-from typing import List, Dict, Optional, Union, Set
+from typing import List, Dict, Optional, Set
 import pypama
 from sqlparser import remove, white, T, I, K
 from sqlparser import (
-    Query, BaseExpression, Joins, AliasedFrom, AliasedExpression,
-    AliasedExpressionList, Select, Function, ColumnName,
+    Query, BaseExpression, 
+    Select, Function, ColumnName,
     Comparison, Wildcard, Operation, Literal, Expression, BooleanOperator,
-    JoinClause, Table
+    JoinClause
 )
 from sqlparser import parse_query
 
@@ -34,11 +30,6 @@ def create_unique(prefix: str, namespace: Set[str]):
         result = f"{prefix}{idx+1}"
     namespace.add(result)
     return result
-
-
-# class Ref:
-#     def __init__(self, lit):
-#         self.idx = lit.value
 
 
 def make_coalesce(df: 'AbstractDataFrame', p: List[BaseExpression]):
@@ -223,14 +214,8 @@ class SimpleDataFrame(AbstractDataFrame):
         return self
 
     def render_column_name(self, col: ColumnName):
-        match col:
-            case ColumnName():
-                return col.name
-            # case BaseExpression():
-            #     return normalize(str(col))
-            # case _:
-            #     raise ValueError()
-
+        return col.name
+        
     def render_deref_column(self, column_name: ColumnName):
         return f"{self.get_frame_variable()}['{self.render_column_name(column_name)}']"
 
@@ -253,6 +238,7 @@ class DataFrame(AbstractDataFrame):
     materialized: List[ExpressionAndAlias]
     groupby: List[ColumnName]
     select: List[ExpressionAndAlias]
+    distinct: bool = False
     aggr: Dict[str, List[str]]
     where: Optional[str]
     namespace: Set[str]  # list of known columns
@@ -270,6 +256,7 @@ class DataFrame(AbstractDataFrame):
         self.renames = {}
         self.select = []
         self.aggr = {}
+        self.distinct = False
         self.namespace = {name} if name else {}
 
     def set_from(self, dataframe: AbstractDataFrame):
@@ -318,6 +305,9 @@ class DataFrame(AbstractDataFrame):
         if new is None:
             raise ValueError()
         self.renames[old] = new
+
+    def set_distinct(self, distinct):
+        self.distinct = distinct
 
     def add_select(self, select: Select):
         for alias, expression in select:
@@ -423,7 +413,10 @@ class DataFrame(AbstractDataFrame):
                     code << ']+ list(_df.columns) + ['
                 else:
                     code << f"'{self.from_.render_column_name(ae)}'" << ','
-            code << ']])' << NL << INDENT
+            code << ']]'
+            if self.distinct:
+                code << ".drop_duplicates()"
+            code << ')' << NL << INDENT
         if self.renames:
             code << f'.rename({self.renames}, axis="columns")' << NL << INDENT
         if self.orderby:
@@ -437,13 +430,14 @@ class DataFrame(AbstractDataFrame):
         return code
 
 
-def make_dataframe(query: Query, from_: AbstractDataFrame):
+def make_dataframe(query: Query| AbstractDataFrame, from_: AbstractDataFrame):
     # alias = exposed_name or af.get_alias() or query.get_frame_variable()
     if isinstance(query, Query):
         # (query.get_frame_variable())
         df = DataFrame(from_.get_frame_variable())
         df.set_from(from_)
         df.add_select(query.select)
+        df.set_distinct(query.distinct)
         df.add_groupby(query.groupby)
         df.add_orderby(query.orderby)
         df.add_limit(query.limit)
@@ -454,16 +448,16 @@ def make_dataframe(query: Query, from_: AbstractDataFrame):
     return df
 
 
-def _code_gen(pq: Query, code: Code, exposed_name, namespace) -> AbstractDataFrame:
+def _code_gen(pq: Query, code: Code, exposed_name, namespace) -> Code:
 
     for af in pq.sub_queries():
         _code_gen(af.get_from_(), code, af.get_exposed_name(), namespace)
     af = SimpleDataFrame(pq.from_[0].get_aliased_from().get_exposed_name())
-    frame = make_dataframe(af.get_from_(), af.get_alias())
+    frame = make_dataframe(af.get_from_(), af)
     for i, join in enumerate(pq.from_[1:]):  # create the joins
         # proxy for the frame that was already created
         af = SimpleDataFrame(join.get_aliased_from().get_exposed_name())
-        f = make_dataframe(af.get_from_(), af.get_alias())
+        f = make_dataframe(af.get_from_(), af)
         join_frame_variable = create_unique('join_df', namespace)
         frame = JoinDataFrame(join_frame_variable, frame,
                               f, join.on_, join.join_type)
@@ -480,6 +474,8 @@ def code_gen(query: str, code: Code, exposed_name: str):
     return _code_gen(pq, code, exposed_name, namespace)
 
 
-for name, fun in list(globals().items()):
-    if isinstance(fun, type) or callable(fun) and not isinstance(fun, pypama.Pattern):
-        fun = typeguard.typechecked(fun)
+if __name__ == "__main__":
+    query = input()
+    code = Code()
+    code_gen(query, code, 'resdf')
+    print(str(code))

@@ -1,6 +1,5 @@
 import typeguard
 import re
-import collections
 import sqlparse
 import pypama
 import itertools
@@ -8,7 +7,6 @@ from dataclasses import dataclass
 
 from typing import List, Optional, Any, Callable, Union, Iterator
 
-import re
 sqlparse.keywords.SQL_REGEX.append(
     (re.compile(r'\$[a-z_][a-z0-9_]*', sqlparse.keywords.FLAGS).match, sqlparse.tokens.Name.Variable))
 
@@ -173,17 +171,15 @@ def read_from(token: sqlparse.sql.Token) -> AliasedFrom:
 
 
 class BaseExpression(QueryComponent):
-
-    def accept(self, visitor):
-        getattr(visitor, 'visit' + self.__class__.__name__)
+    pass
 
 
 class Expression(BaseExpression):
     def __init__(self, items: List[Optional[BaseExpression] | 'BooleanOperator']):
-        if isinstance(items, list):
-            self.items = items
-        else:
-            self.items = [items]
+        # if isinstance(items, list):
+        self.items = items
+        # else:
+        #     self.items = [items]
 
     def __repr__(self):
         return f"<{self.__class__.__name__} {self}>"
@@ -398,7 +394,6 @@ class Join(QueryComponent):
 
 
 class Joins(list, QueryComponent):
-
     def __str__(self):
         return ' '.join(str(i) for i in self)
 
@@ -584,24 +579,6 @@ def read_identifier_list(token: Optional[sqlparse.sql.Token]) -> Optional[Aliase
     return AliasedExpressionList(result)
 
 
-# class ExpressionList(QueryComponent):
-#     expression_list: List[BaseExpression]
-
-#     def __init__(self, expression_list: List[BaseExpression]):
-#         self.expression_list = expression_list
-#         assert all(isinstance(i, BaseExpression) for i in expression_list)
-
-#     def __iter__(self):
-#         return iter(self.expression_list)
-
-#     def __str__(self):
-#         return ', '.join(str(i) for i in self.expression_list)
-
-#     def __repr__(self):
-#         el = ', '.join(repr(i) for i in self.expression_list)
-#         return f"<EL {el}>"
-
-
 def read_expression_list(tokens: List[sqlparse.sql.Token]) -> List[BaseExpression]:
     if tokens is None:
         return None
@@ -671,7 +648,7 @@ def read_where(token: List[sqlparse.sql.Token]) -> Expression:
 QUERY_PATTERN = pypama.build_pattern(
     (T.Keyword.CTE + (I.Identifier | I.IdentifierList).capture('CTE')).opt(),
     T.Keyword.DML,
-    T.Keyword.DISTINCT.opt().capture('DISTINCT'),
+    (T.Keyword & (lambda t:t.value.lower()=='distinct')).opt().capture('DISTINCT'),
     (I.IdentifierList | I.Identifier | T.Wildcard |
      I.Function | I.Comparison | I.Operation).star().capture('SELECT'),
     K.FROM,
@@ -756,9 +733,6 @@ class Query(QueryComponent):
                     # yield from q.sub_queries()
                     yield af
 
-    # def get_frame_name(self) -> Optional[str]:
-    #     return self.from_.get_name()
-
     def get_name(self):
         return None
 
@@ -810,11 +784,3 @@ def parse_query(s: str) -> Query:
     tokens = sqlparse.parse(s)[0].tokens
     return read_query(tokens)
 
-
-for name, fun in list(globals().items()):
-    if name in ["TClass", "IClass", "KClass"]:
-        continue
-    if isinstance(fun, (TClass, KClass, IClass)):
-        continue
-    if isinstance(fun, type) or callable(fun):
-        fun = typeguard.typechecked(fun)
