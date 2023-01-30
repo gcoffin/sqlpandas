@@ -68,11 +68,6 @@ class QueryComponent:
     pass
 
 
-class Visitable:
-    def accept(self, visitor):
-        pass
-
-
 class Table(QueryComponent):
     name: str
 
@@ -141,6 +136,18 @@ def read_table(token: sqlparse.sql.Token) -> Union['Query', Table]:
             return Table(token.value)
         case _:
             raise SQLSyntaxError("Expected Name or ()", token)
+
+
+def read_cte(token: sqlparse.sql.Token) -> AliasedFrom:
+    assert I.Identifier(token)
+    match remove(token.tokens):
+        case [sqlparse.sql.Token(ttype=sqlparse.tokens.Token.Name, value=name),
+              sqlparse.sql.Token(
+                  ttype=sqlparse.tokens.Token.Keyword, value='as'),
+              sqlparse.sql.Parenthesis() as par]:
+            return AliasedFrom(name, read_table(par))
+        case _:
+            raise SQLSyntaxError(f"Expected Name or embedded query", token)
 
 
 def read_from(token: sqlparse.sql.Token) -> AliasedFrom:
@@ -442,10 +449,6 @@ def read_join(from_tokens, joins_tokens) -> Joins:
             assert (I.Token(join[-1]) and 'join' in join[-1].value.lower())
             join = ' '.join(map(str, join))
         match select_on_tokens:
-            # case [sqlparse.sql.Identifier() as identifier]:
-            #     # alias, from_ = unpack_identifier(identifier)
-            #     select_from = read_from(identifier)
-            #     results.append(Join(select_from, None, join))
             case [from_, sqlparse.sql.Token() as token_on, *on_clause] if K.ON(token_on):
                 select_from = read_from(from_)
                 on_clause = read_join_expression(on_clause)
@@ -457,6 +460,23 @@ def read_join(from_tokens, joins_tokens) -> Joins:
                 raise SQLSyntaxError(
                     "Expected token [ON on clause]", select_on_tokens)
     return results
+
+
+WITH_PATTERN = pypama.build_pattern(
+    T.Keyword.CTE, I.Identifier.capture('query'))
+
+
+def read_with_clause(tokens: List[sqlparse.sql.Token]) -> List[AliasedFrom]:
+    result = []
+    assert len(tokens)==1
+    token, = tokens
+    if I.Identifier(token):
+        result.append(read_cte(token))
+    elif I.IdentifierList(token):
+        for t in token.get_identifiers():
+            result.append(read_cte(t))
+        
+    return result
 
 
 class AliasedExpression(QueryComponent):
@@ -564,25 +584,25 @@ def read_identifier_list(token: Optional[sqlparse.sql.Token]) -> Optional[Aliase
     return AliasedExpressionList(result)
 
 
-class ExpressionList(QueryComponent):
-    expression_list: List[BaseExpression]
+# class ExpressionList(QueryComponent):
+#     expression_list: List[BaseExpression]
 
-    def __init__(self, expression_list: List[BaseExpression]):
-        self.expression_list = expression_list
-        assert all(isinstance(i, BaseExpression) for i in expression_list)
+#     def __init__(self, expression_list: List[BaseExpression]):
+#         self.expression_list = expression_list
+#         assert all(isinstance(i, BaseExpression) for i in expression_list)
 
-    def __iter__(self):
-        return iter(self.expression_list)
+#     def __iter__(self):
+#         return iter(self.expression_list)
 
-    def __str__(self):
-        return ', '.join(str(i) for i in self.expression_list)
+#     def __str__(self):
+#         return ', '.join(str(i) for i in self.expression_list)
 
-    def __repr__(self):
-        el = ', '.join(repr(i) for i in self.expression_list)
-        return f"<EL {el}>"
+#     def __repr__(self):
+#         el = ', '.join(repr(i) for i in self.expression_list)
+#         return f"<EL {el}>"
 
 
-def read_expression_list(tokens: List[sqlparse.sql.Token]) -> ExpressionList:
+def read_expression_list(tokens: List[sqlparse.sql.Token]) -> List[BaseExpression]:
     if tokens is None:
         return None
     result = []
@@ -595,13 +615,13 @@ def read_expression_list(tokens: List[sqlparse.sql.Token]) -> ExpressionList:
                 result.append(read_expression([token]))
             case sqlparse.sql.Token() if T.Literal.Number.Integer(token):
                 result.append(Literal(token.value, token.ttype))
+            case sqlparse.sql.IdentifierList():
+                for i in token.get_identifiers():
+                    result.extend(read_expression_list([i]))
             case _:
                 raise SQLSyntaxError(
                     "Expected identifier or expression", token)
-    if not result:
-        return None
-    else:
-        return ExpressionList(result)
+    return result
 
 
 class Select(QueryComponent):
@@ -649,6 +669,7 @@ def read_where(token: List[sqlparse.sql.Token]) -> Expression:
 
 
 QUERY_PATTERN = pypama.build_pattern(
+    (T.Keyword.CTE + (I.Identifier | I.IdentifierList).capture('CTE')).opt(),
     T.Keyword.DML,
     T.Keyword.DISTINCT.opt().capture('DISTINCT'),
     (I.IdentifierList | I.Identifier | T.Wildcard |
@@ -693,7 +714,8 @@ class StrBuilder:
         return res
 
     def __str__(self):
-        return ' '.join(str(i) for i in self.flatten() if i is not None)
+        res = ' '.join(str(i) for i in self.flatten() if i is not None)
+        return res
 
     def __repr__(self):
         return ' '.join((i if isinstance(i, str) else repr(i)) for i in self.buffer if i is not None)
@@ -707,10 +729,11 @@ class Query(QueryComponent):
         array_joins: Optional[List[BaseExpression]] = None,
         distinct: bool = False,
         where: Optional[BaseExpression] = None,
-        groupby: Optional[ExpressionList] = None,
-        orderby: Optional[ExpressionList] = None,
-        having: Optional[ExpressionList] = None,
-        limit: Optional[Literal] = None
+        groupby: Optional[List[BaseExpression]] = None,
+        orderby: Optional[List[BaseExpression]] = None,
+        having: Optional[List[BaseExpression]] = None,
+        limit: Optional[Literal] = None,
+        with_clause: Optional[List[AliasedFrom]] = None
     ):
         self.select = select
         self.from_ = from_
@@ -721,8 +744,10 @@ class Query(QueryComponent):
         self.orderby = orderby
         self.having = having
         self.limit = limit
+        self.with_clause = with_clause
 
     def sub_queries(self) -> Iterator[AliasedFrom]:
+        yield from self.with_clause
         for join in self.from_:
             match join:
                 case Join(aliased_from=AliasedFrom(inner_from=Table())):
@@ -731,8 +756,8 @@ class Query(QueryComponent):
                     # yield from q.sub_queries()
                     yield af
 
-    def get_frame_name(self) -> Optional[str]:
-        return self.from_.get_name()
+    # def get_frame_name(self) -> Optional[str]:
+    #     return self.from_.get_name()
 
     def get_name(self):
         return None
@@ -741,7 +766,7 @@ class Query(QueryComponent):
         builder << 'SELECT' << self.select << 'FROM' << self.from_
         builder << (self.where and StrBuilder('WHERE', self.where))
         builder << (self.groupby and StrBuilder('GROUP BY', self.groupby))
-        builder << (self.orderby and StrBuilder('ORDER BY', self.orderby))
+        builder << (self.orderby and StrBuilder('ORDER BY', StrBuilder(*self.orderby)))
         builder << (self.having and StrBuilder('HAVING', self.having))
         builder << (self.limit and StrBuilder('LIMIT', self.limit))
         return builder
@@ -773,10 +798,11 @@ def read_query(tokens: List[sqlparse.sql.Token]) -> Query:
             read_array_joins(vars['ARRAYJOINS']),
             bool(vars.get('DISTINCT', False)),
             read_where(vars.get('WHERE')),
-            read_expression_list(vars.get('GROUPBY')),
-            read_expression_list(vars.get('ORDERBY')),
+            read_expression_list(vars.get('GROUPBY')) or None,
+            read_expression_list(vars.get('ORDERBY')) or None,
             read_where(vars.get('HAVING')),
-            read_expression(vars['LIMIT']) if 'LIMIT' in vars else None
+            read_expression(vars['LIMIT']) if 'LIMIT' in vars else None,
+            read_with_clause(vars['CTE']) if 'CTE' in vars else []
         )
 
 

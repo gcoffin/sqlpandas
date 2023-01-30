@@ -1,3 +1,4 @@
+import math
 from sqldf import parse_query, Code, DataFrame, code_gen
 import numpy as np
 import pytest
@@ -36,7 +37,6 @@ resql = pd.read_sql('''{q}''', con=con)
 
 QUERIES = [
     """select df.height, coalesce(df.name,'-') from df""",
-    """select df2.town as toto, name from df join df2 on df.town=df2.town order by name""",
     """select df.id as a from df""",
     """select count(height) from df""",
     """select town, avg(height) from df where gender='M' and not name='Paulette' group by town""",
@@ -45,14 +45,18 @@ QUERIES = [
     """select height, round(height/10) as height_range from df""",
     """select b from (select height*2 as b from df) as foo""",
     """select count(id) as cnt, sum(id) as s, round(height/10) as height_range from df group by round(height/10)""",
-    """select df2.habitants, df.name from df join df2 on df.town=df2.town order by name""",
+    """select habitants, name from df join df2 on df.town=df2.town order by name""",
     """select df.id as a from df order by a limit 3""",
     """select coalesce(id,-1) from df right join (select town as town2, habitants from df2) as df3
      on df.town=df3.town2 order by 1""",
-    """select * from (select * from df) as df1""",
+    """select * from (select * from df) as df1 order by name""",
     """select * from (select * from (select * from df) as df1) as df2""",
     """select avg(height), round(height/10) as height_range from df group by 2""",
     """select * from (select id from df) as df1 cross join (select id from df) as df2 where df1.id < df2.id""",
+    """with df1 as (select height from df),
+        df2 as (select height from df)
+        select df1.height,df2.height from df1
+        cross join df2 where df1.height>df2.height order by 1,2""" ,
 ]
 
 
@@ -86,12 +90,19 @@ def test_query(q):
 
 
 QUERIES2 = [
-    # (
-    #     """select town, list(height) as height_range from df group by 1""",
-    #     [['Lyon',  [165, 162, 184]], ['Paris', [182, 190]]]
-    # ),
-    (
-        """select * from 
+    ("""select town, list(height) as height_range from df group by 1""",
+        [['Lyon',  [165, 162, 184]], ['Paris', [182, 190]]]
+     ),
+    ("""select name, town as toto from df join df2 on df.town=df2.town order by name""",
+     [
+         ['Farid',     'Lyon'],
+         ['Josiane',   'Lyon'],
+         ['Kevin',     'Paris'],
+         ['Paulette',  'Lyon'],
+         ['Raymond',  'Paris'],
+     ]
+     ),
+    ("""select * from 
             (select town, list(height) as height_range from df group by 1) as dflist
             array join dflist.height_range""",
         [['Lyon',  165],
@@ -100,8 +111,13 @@ QUERIES2 = [
          ['Paris', 182],
          ['Paris', 190]
          ]
-
-    )
+     ),
+    ("""select log(height)*2+pow(height,2) from df""",
+     [[math.log(x)*2+x**2] for _, _, _, x, _ in DATA]
+     ),
+    ("""with table1 as (select set(lower(town)) as t from df) select t from table1 array join t order by t""",
+     [['lyon'], ['paris']]
+     )
 ]
 
 

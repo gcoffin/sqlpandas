@@ -8,7 +8,7 @@ import pypama
 from sqlparser import remove, white, T, I, K
 from sqlparser import (
     Query, BaseExpression, Joins, AliasedFrom, AliasedExpression,
-    AliasedExpressionList, Select, ExpressionList, Function, ColumnName,
+    AliasedExpressionList, Select, Function, ColumnName,
     Comparison, Wildcard, Operation, Literal, Expression, BooleanOperator,
     JoinClause, Table
 )
@@ -23,27 +23,25 @@ CONVERT_OP = {
 }
 
 
-def create_unique(prefix, namespace):
+def create_unique(prefix: str, namespace: Set[str]):
     if not prefix in namespace:
         result = prefix
     else:
-        idx = max(
-            (
-                int(m.group(1))
-                for m in (
-                    re.match(f'{prefix}(\\d*)', s) for s in namespace if s
-                ) if m), default=0)
+        idx = max((int(m.group(1))
+                   for m in (
+            re.match(f'{prefix}(\\d*)', s) for s in namespace if s
+        ) if m), default=0)
         result = f"{prefix}{idx+1}"
     namespace.add(result)
     return result
 
 
-class Ref:
-    def __init__(self, lit):
-        self.idx = lit.value
+# class Ref:
+#     def __init__(self, lit):
+#         self.idx = lit.value
 
 
-def make_coalesce(df, p):
+def make_coalesce(df: 'AbstractDataFrame', p: List[BaseExpression]):
     match p:
         case [ColumnName() as s, Literal() as q]:
             return f"{df.render(s)}.fillna({df.render(q)})"
@@ -56,12 +54,19 @@ AGGR_FUNCTIONS = {
     'sum': ("'sum'", 'sum'),
     'count': ("'count'", 'count'),
     'avg': ("'mean'", 'mean'),
-    'list': ("list", 'list')
+    'list': ("list", 'list'),
+    'set': ("lambda t: frozenset(t.unique())", '<lambda>')
 }
 
 CONV_FUNCTION = {
     'round': lambda df, p: f"np.round({','.join(df.render(i) for i in p)})",
-    'coalesce': make_coalesce
+    'coalesce': make_coalesce,
+    'log': "np.log",
+    'pow': ".pow",
+    'sin': 'np.sin',
+    'cos': 'np.cos',
+    'tan': 'np.tan',
+    'lower': '.str.lower',
 }
 
 
@@ -89,8 +94,8 @@ class ExpressionAndAlias(BaseExpression):
     def name(self):
         return self.alias
 
-    def get_exposed_name(self):
-        return self.alias or self.expression.name
+    # def get_exposed_name(self):
+    #     return self.alias or self.expression.name
 
     def __iter__(self):
         yield self.alias
@@ -99,8 +104,8 @@ class ExpressionAndAlias(BaseExpression):
     def __repr__(self):
         return f"<EA {self.alias}, {self.expression}>"
 
-    def __str__(self):
-        return f"{self.alias} AS {self.expression}"
+    # def __str__(self):
+    #     return f"{self.alias} AS {self.expression}"
 
 
 JOIN_TYPES = {
@@ -123,7 +128,15 @@ class AbstractDataFrame:
         pass
 
     def render_function(self, name: str, parameters: List[BaseExpression]):
-        return CONV_FUNCTION.get(name, name)(self, parameters)
+        fun = CONV_FUNCTION.get(name, name)
+        if callable(fun):
+            return fun(self, parameters)
+        else:
+            if fun.startswith('.'):
+                this, *params = parameters
+                return f"{self.render(this)}{fun}({','.join(map(self.render, params))})"
+            else:
+                return f"{fun}({','.join(map(self.render, parameters))})"
 
     def render(self, expression: BaseExpression) -> str:
         # namespace = namespace or self.name
@@ -137,12 +150,12 @@ class AbstractDataFrame:
                 return self.render_deref_column(expression)
             case Function(name=name, parameters=parameters):
                 return self.render_function(name, parameters)
-            case AliasedExpression(alias=alias, expression=expr):
-                return self.render(expr)
+            # case AliasedExpression(alias=alias, expression=expr):
+            #     return self.render(expr)
             case Literal():
                 return str(expression)
-            case ExpressionAndAlias(alias=alias, expression=expr):
-                return self.render(expr)
+            # case ExpressionAndAlias(alias=alias, expression=expr):
+            #     return self.render(expr)
             case Expression(items=items):
                 result = []
                 for item in items:
@@ -152,8 +165,8 @@ class AbstractDataFrame:
                         case _ if item is not None:
                             result.extend(['(', self.render(item), ')'])
                 return ' '.join(result)
-            case [token]:
-                return self.render(token)
+            # case [token]:
+            #     return self.render(token)
             case _:
                 raise ValueError()
 
@@ -199,7 +212,9 @@ class JoinDataFrame(AbstractDataFrame):
             code << f'how="{self.jointype}"'
             code << ')' << NL
 
-    def render_column_name(self, col):
+    def render_column_name(self, col: ColumnName):
+        if col.prefix is None:
+            return col.name
         return f"{col.name}_{col.prefix}"
 
 
@@ -207,8 +222,14 @@ class SimpleDataFrame(AbstractDataFrame):
     def get_from_(self):
         return self
 
-    def render_column_name(self, col):
-        return col.name
+    def render_column_name(self, col: ColumnName):
+        match col:
+            case ColumnName():
+                return col.name
+            # case BaseExpression():
+            #     return normalize(str(col))
+            # case _:
+            #     raise ValueError()
 
     def render_deref_column(self, column_name: ColumnName):
         return f"{self.get_frame_variable()}['{self.render_column_name(column_name)}']"
@@ -221,8 +242,13 @@ NL = '\n'
 INDENT = '    '
 
 
+def normalize(r: str):
+    r = r.replace(' ', '')
+    r = re.sub('[^a-zA-Z0-9]+', '_', r)
+    return '_'+r
+
+
 class DataFrame(AbstractDataFrame):
-    select: List[ExpressionAndAlias]
     variable_name: str
     materialized: List[ExpressionAndAlias]
     groupby: List[ColumnName]
@@ -232,7 +258,7 @@ class DataFrame(AbstractDataFrame):
     namespace: Set[str]  # list of known columns
     from_: Optional[AbstractDataFrame]
 
-    def __init__(self, name):
+    def __init__(self, name: str):
         self.variable_name = name
         self.from_: AbstractDataFrame = None
         self.where = None
@@ -255,10 +281,10 @@ class DataFrame(AbstractDataFrame):
     def render_deref_column(self, column_name: ColumnName):
         return f"{self.from_.get_frame_variable()}['{self.from_.render_column_name(column_name)}']"
 
-    def render_column_name(self, col):
+    def render_column_name(self, col: ColumnName):
         return col.name
 
-    def add_where(self, where):
+    def add_where(self, where: Optional[BaseExpression]):
         if where:
             self.where = where
 
@@ -270,28 +296,25 @@ class DataFrame(AbstractDataFrame):
                 self.array_joins.append(aj)
 
     def create_name(self, expr: BaseExpression) -> str:
-        r = create_unique(str(expr), self.namespace)
-        r = r.replace(' ', '')
-        r = re.sub('[^a-zA-Z0-9]+', '_', r)
-        return '_'+r
+        return create_unique(normalize(str(expr)), self.namespace)
 
-    def materialize(self, expr: BaseExpression) -> Union[ColumnName, ExpressionAndAlias]:
+    def materialize(self, expr: BaseExpression) -> ColumnName:
         if isinstance(expr, ColumnName):
             return expr
         existing = next(
             (a for a in self.materialized if a.expression == expr), None)
         if existing:
-            return existing
+            return ColumnName(existing.alias)
         else:
             col = self.create_name(expr)
             self.materialized.append(ea := ExpressionAndAlias(col, expr))
-            return ea
+            return ColumnName(ea.alias)
 
-    def set_alias(self, colname, alias):
-        if colname != alias and alias is not None:
-            self.rename(colname, alias)
+    # def set_alias(self, colname:str, alias:str):
+    #     if colname != alias and alias is not None:
+    #         self.rename(colname, alias)
 
-    def rename(self, old, new):
+    def rename(self, old: str, new: str):
         if new is None:
             raise ValueError()
         self.renames[old] = new
@@ -304,11 +327,11 @@ class DataFrame(AbstractDataFrame):
                     self.aggr.setdefault(c.name, []).append(
                         AGGR_FUNCTIONS[func_name.lower()][0])
                     aggr_name = f'{c.name}_{AGGR_FUNCTIONS[func_name.lower()][1]}'
-                    self.select.append(ExpressionAndAlias(aggr_name, None))
+                    self.select.append(ColumnName(aggr_name))
                     self.rename(
                         aggr_name, alias or self.create_name(expression))
                 case ColumnName() as col:
-                    self.select.append(ExpressionAndAlias(None, col))
+                    self.select.append(col)
                     if alias is not None:
                         self.rename(col.name, alias)
                 case Function() | Operation() | Comparison():
@@ -317,11 +340,11 @@ class DataFrame(AbstractDataFrame):
                     if alias is not None:
                         self.rename(c.name, alias)
                 case Wildcard():
-                    self.select.append(ExpressionAndAlias(None, expression))
+                    self.select.append(expression)
                 case _:
                     raise ValueError()
 
-    def add_groupby(self, groupby: Optional[ExpressionList]):
+    def add_groupby(self, groupby: Optional[List[BaseExpression]]):
         assert not self.groupby
         for expression in (groupby or []):
             match expression:
@@ -330,9 +353,9 @@ class DataFrame(AbstractDataFrame):
                 case Literal():
                     self.groupby.append(self.select[int(expression.value) - 1])
                 case _:
-                    self.groupby.append(self.materialize(expression).name)
+                    self.groupby.append(self.materialize(expression))
 
-    def add_orderby(self, orderby):
+    def add_orderby(self, orderby: Optional[List[BaseExpression]]):
         for expression in (orderby or []):
             match expression:
                 case ColumnName():
@@ -342,13 +365,14 @@ class DataFrame(AbstractDataFrame):
                 case _:
                     self.orderby.append(self.materialize(expression).name)
 
-    def add_limit(self, limit):
+    def add_limit(self, limit: Optional[BaseExpression]):
         self.limit = limit
 
     def render_name(self, name):
         match name:
             case ExpressionAndAlias():
-                return name.get_exposed_name()
+                # name.get_exposed_name()
+                return self.from_.render_column_name(name.expression)
             case ColumnName(name=n):
                 return n
             case _:
@@ -384,24 +408,29 @@ class DataFrame(AbstractDataFrame):
                     ".pipe(lambda ag: pd.DataFrame("
                     "data=ag.values.reshape((1,-1)), "
                     "columns=pd.MultiIndex.from_product([ag.columns, ag.index]))"
-                    ".dropna(axis='columns'))"
-                ) << NL << INDENT
-            code << ".pipe(lambda df: df.set_axis(['_'.join(i for i in x if i) for x in df.columns], axis='columns'))"
-            code << NL << INDENT
+                )
+                code << NL << INDENT
+                code << ".pipe(lambda df: df.set_axis(['_'.join(i for i in x if i) for x in df.columns], axis='columns'))"
+                code << ".dropna(axis='columns'))"
+                code << NL << INDENT
+            else:
+                code << ".pipe(lambda df: df.set_axis(['_'.join(i for i in x if i) for x in df.columns], axis='columns'))"
+                code << NL << INDENT
         if self.select and not (len(self.select) == 1 and self.select[0] == Wildcard()):
             code << '.pipe(lambda _df: _df[['
             for ae in self.select:
-                if isinstance(ae.expression, Wildcard):
+                if isinstance(ae, Wildcard):
                     code << ']+ list(_df.columns) + ['
                 else:
-                    code << f"'{self.render_name(ae.get_exposed_name())}'" << ','
+                    code << f"'{self.from_.render_column_name(ae)}'" << ','
             code << ']])' << NL << INDENT
         if self.renames:
             code << f'.rename({self.renames}, axis="columns")' << NL << INDENT
         if self.orderby:
-            code << ".sort_values("
-            code << ','.join(f"'{self.render_name(i)}'" for i in self.orderby)
-            code << ')' << NL << INDENT
+            code << ".sort_values(["
+            code << ','.join(
+                f"'{self.from_.render_column_name(i)}'" for i in self.orderby)
+            code << '])' << NL << INDENT
         if self.limit:
             code << f".iloc[:{self.render(self.limit)}]"
         code << ')'
