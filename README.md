@@ -19,9 +19,11 @@ For complex transformations, SQL is more expressive than pandas. This tool provi
 
 Usage
 -----
+```
 python sqldf.py
 >>> enter your query
 [output is the equivalent python code with pandas]
+```
 
 Current status of implementation
 --------------------------------
