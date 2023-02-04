@@ -199,10 +199,14 @@ class Expression(BaseExpression):
 @dataclass
 class Function(BaseExpression):
     name: str
-    parameters: List[BaseExpression]
+    parameters: Union[List[BaseExpression], 'Distinct']
 
     def __str__(self):
-        return f"{self.name}({','.join(str(i) for i in self.parameters)})"
+        match self.parameters:
+            case Distinct(value=lst):
+                return f"{self.name}(DISTINCT {','.join(str(i) for i in self.parameters.value)})"
+            case _:
+                return f"{self.name}({','.join(str(i) for i in self.parameters)})"
 
 
 @dataclass
@@ -265,11 +269,14 @@ class BooleanOperator:
     def __str__(self):
         return self.value
 
+@dataclass
+class Distinct(BaseExpression):
+    value: List[BaseExpression]
 
 BOOLEAN_OP_PATTERN = pypama.build_pattern((K.AND | K.OR | K.NOT).capture())
 
 
-def read_parameter_list(token: sqlparse.sql.Identifier) -> List[BaseExpression]:
+def read_parameter_list(token: sqlparse.sql.IdentifierList) -> List[BaseExpression]:
     if token is None:
         return None
     result = []
@@ -290,7 +297,7 @@ def read_parameter_list(token: sqlparse.sql.Identifier) -> List[BaseExpression]:
 
 
 def get_function_parameters(tokens):
-    match tokens:
+    match remove(tokens):
         case [
             sqlparse.sql.Token() as p1,
             sqlparse.sql.IdentifierList() as il,
@@ -303,6 +310,19 @@ def get_function_parameters(tokens):
             sqlparse.sql.Token() as p2
         ] if T.Punctuation(p1) and T.Punctuation(p2):
             return [read_expression([expr])]
+        case [
+            sqlparse.sql.Token() as p1,
+            sqlparse.sql.Token() as expr,
+            sqlparse.sql.Token() as p2
+        ] if T.Literal(expr):
+            return [read_expression([expr])]
+        case [
+            sqlparse.sql.Token() as p1,
+            sqlparse.sql.Token() as distinct,
+            (sqlparse.sql.Identifier() | sqlparse.sql.Operation() | sqlparse.sql.Function()) as expr,
+            sqlparse.sql.Token() as p2
+        ] if T.Punctuation(p1) and T.Punctuation(p2) and T.Keyword(distinct) and distinct.value.lower()=='distinct':
+            return Distinct([read_expression([expr])])
     raise ValueError(tokens)
 
 

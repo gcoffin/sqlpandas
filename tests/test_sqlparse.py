@@ -46,6 +46,9 @@ def test_idempotent():
         """SELECT a AS a FROM ( b ) AS b JOIN ( c ) AS cc ON b.a = c.a OUTER JOIN ( d ) AS d ON c.a = d.b""")
     assert_same(
         'SELECT a AS a FROM ( b ) AS b LEFT JOIN ( SELECT b AS b FROM ( d ) AS d ) AS cc ON b.a = cc.a')
+    assert_same(
+        'SELECT COUNT(DISTINCT a) FROM ( b ) AS b'
+    )
 
 
 def test_simple():

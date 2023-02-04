@@ -6,16 +6,27 @@ from sqlparser import (
     Query, BaseExpression, 
     Select, Function, ColumnName,
     Comparison, Wildcard, Operation, Literal, Expression, BooleanOperator,
-    JoinClause
+    JoinClause, Distinct
 )
 from sqlparser import parse_query
 
 
-CONVERT_OP = {
+def make_binary_op(v):
+    return f'{{l}} {v} {{r}}'
+
+_BINARY_OPS = {
     '=': '==',
-    'AND': '&',
-    'OR': '|',
-    'NOT': '~'
+    'AND':'&',
+    'OR':'|',
+    '<>': '!=',
+    **{k:k for k in ['<=','>=',*'+/*-%<>']}
+}
+
+CONVERT_OP = {
+    'NOT': '~{r}',
+    'LIKE': "{l}.str.match(({r}).replace('%','.*'))",
+    'REGEXP': "{l}.str.match({r})",
+    ** {k: make_binary_op(v) for k,v in _BINARY_OPS.items()}
 }
 
 
@@ -46,7 +57,9 @@ AGGR_FUNCTIONS = {
     'count': ("'count'", 'count'),
     'avg': ("'mean'", 'mean'),
     'list': ("list", 'list'),
-    'set': ("lambda t: frozenset(t.unique())", '<lambda>')
+    'set': ("lambda t: frozenset(t.unique())", '<lambda>'),
+    'min': ("'min'", 'min'),
+    'max': ("'max'", 'max'),
 }
 
 CONV_FUNCTION = {
@@ -58,6 +71,9 @@ CONV_FUNCTION = {
     'cos': 'np.cos',
     'tan': 'np.tan',
     'lower': '.str.lower',
+    'upper': '.str.upper',
+    'length': '.str.len',
+    'slice': '.str.slice'
 }
 
 
@@ -118,8 +134,15 @@ class AbstractDataFrame:
     def render_column_name(self, col: ColumnName, frame_variable_name: Optional[str] = None):
         pass
 
-    def render_function(self, name: str, parameters: List[BaseExpression]):
+    def render_function(self, name: str, parameters: List[BaseExpression]| Distinct):
         fun = CONV_FUNCTION.get(name, name)
+        is_distinct = False
+        # if isinstance(parameters, Distinct):
+        #     parameters = parameters.value
+        #     if fun == 'count':
+        #         return f"pd.concat([{','.join(map(self.render, parameters))}], axis=1).drop_duplicates().size"
+        #     else:
+        #         raise NotImplementedError()
         if callable(fun):
             return fun(self, parameters)
         else:
@@ -135,8 +158,8 @@ class AbstractDataFrame:
             case Operation(left=left, right=right, value=op):
                 l = self.render(left)
                 r = self.render(right)
-                o = CONVERT_OP.get(op, op)
-                return f"{l} {o} {r}"
+                return CONVERT_OP[op.upper()].format(l=l, r=r)
+                # return f"{l} {o} {r}"
             case ColumnName():
                 return self.render_deref_column(expression)
             case Function(name=name, parameters=parameters):
@@ -152,7 +175,8 @@ class AbstractDataFrame:
                 for item in items:
                     match item:
                         case BooleanOperator(value=value):
-                            result.append(CONVERT_OP.get(value.upper(), value))
+                            result.append(CONVERT_OP[value.upper()].format(r='', l=''))
+                            # result.append(CONVERT_OP.get(value.upper(), value))
                         case _ if item is not None:
                             result.extend(['(', self.render(item), ')'])
                 return ' '.join(result)
@@ -181,7 +205,7 @@ class JoinDataFrame(AbstractDataFrame):
     def get_frame_variable(self):
         return self.variable_name
 
-    def generate_cross_join(self, code):
+    def _generate_cross_join(self, code):
         code << "pd.merge(" << self.df1.get_frame_variable(
         ) << '.assign(__crossjoin=0),'
         code << self.df2.get_frame_variable() << '.assign(__crossjoin=0),'
@@ -192,7 +216,7 @@ class JoinDataFrame(AbstractDataFrame):
 
     def generate_code_body(self, code):
         if self.jointype == 'cross':
-            return self.generate_cross_join(code)
+            return self._generate_cross_join(code)
         else:
             assert self.join_clause is not None, ValueError('no join clause')
             code << "pd.merge(" << self.df1.get_frame_variable() << ","
@@ -312,6 +336,14 @@ class DataFrame(AbstractDataFrame):
     def add_select(self, select: Select):
         for alias, expression in select:
             match expression:
+                case Function(name=func_name, parameters=Distinct(value=[parameter])) if func_name.lower() in AGGR_FUNCTIONS:
+                    c = self.materialize(parameter)
+                    assert func_name.lower() == 'count'
+                    self.aggr.setdefault(c.name, []).append("'nunique'")
+                    aggr_name = f'{c.name}_nunique'
+                    self.select.append(ColumnName(aggr_name))
+                    self.rename(
+                        aggr_name, alias or self.create_name(expression))
                 case Function(name=func_name, parameters=[parameter]) if func_name.lower() in AGGR_FUNCTIONS:
                     c = self.materialize(parameter)
                     self.aggr.setdefault(c.name, []).append(
@@ -376,7 +408,7 @@ class DataFrame(AbstractDataFrame):
             for col, exp in self.materialized:
                 code << col << "= lambda _df:("
                 code << SimpleDataFrame('_df').render(
-                    exp) << ')' << NL << INDENT
+                    exp) << '),' << NL << INDENT
             code << ")" << NL << INDENT
         if self.array_joins:
             for aj in self.array_joins:

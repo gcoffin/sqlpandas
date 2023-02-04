@@ -5,6 +5,6 @@
     "python.testing.unittestEnabled": false,
     "python.testing.pytestEnabled": true,
     "terminal.integrated.env.windows": {
-        "PYTHONPATH": "src,tests"
+        "PYTHONPATH": "src"
     }
 }

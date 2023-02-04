@@ -3,6 +3,8 @@ import math
 import numpy as np
 import pytest
 
+print(sys.path)
+
 from sqldf import parse_query, Code, DataFrame, code_gen
 
 HEADER = ['id', 'name', 'gender', 'height', 'town']
@@ -34,10 +36,15 @@ con = sqlite3.connect(":memory:")
 cursor = con.cursor()
 df.to_sql('df', con, index=False)
 df2.to_sql('df2', con, index=False)
-resql = pd.read_sql('''{q}''', con=con)
+resql = pd.read_sql('''{q} ''', con=con)
 """
 
 QUERIES = [
+    """select distinct town from df""",
+    """select count(distinct town) from df""",
+    """select count(1) from (select distinct town from df) as q""",
+    """select town, height from df where town like '%ris'""",
+    """select town, height from df where not town like '%ris'""",
     """select df.height, coalesce(df.name,'-') from df""",
     """select distinct town from df""",
     """select df.id as a from df""",
@@ -60,6 +67,7 @@ QUERIES = [
         df2 as (select height from df)
         select df1.height,df2.height from df1
         cross join df2 where df1.height>df2.height order by 1,2""" ,
+    # """select 2*count(distinct id) from df"""
 ]
 
 
@@ -82,7 +90,8 @@ def test_query(q):
     print('----------')
     print(q)
     print(d['resdf'])
-
+    print()
+    print(str(code))
     if not (np.array_equal(drop_hidden(d['resdf']).values, d['resql'].values)):
         print()
         print(str(code))
@@ -120,7 +129,11 @@ QUERIES2 = [
      ),
     ("""with table1 as (select set(lower(town)) as t from df) select t from table1 array join t order by t""",
      [['lyon'], ['paris']]
-     )
+     ),
+         ("""select town, length(height_range), slice(height_range,0,1), height_range
+         from (select town, list(height) as height_range from df group by 1) as q1""",
+        [['Lyon', 3, [165], [165, 162, 184]], ['Paris', 2, [182,], [182, 190]]]
+     ),
 ]
 
 
@@ -133,6 +146,9 @@ def test_query2(q, data):
     try:
         exec(INTRO1.format(q=q) + str(code), d)
     except Exception:
+        print('----------ERROR')
+        print(q)
+        print()
         print(INTRO1.format(q=q) + str(code))
         raise
     print('----------')
@@ -152,6 +168,6 @@ if __name__ == "__main__":
     if 1:
         for q in QUERIES:
             test_query(q)
-    if 1:
+    if 0:
         for q in QUERIES2:
             test_query2(*q)
