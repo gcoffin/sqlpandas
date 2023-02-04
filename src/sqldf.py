@@ -3,10 +3,10 @@ from typing import List, Dict, Optional, Set
 import pypama
 from sqlparser import remove, white, T, I, K
 from sqlparser import (
-    Query, BaseExpression, 
+    Query, BaseExpression,
     Select, Function, ColumnName,
     Comparison, Wildcard, Operation, Literal, Expression, BooleanOperator,
-    JoinClause, Distinct
+    JoinClause, Distinct, ValueList
 )
 from sqlparser import parse_query
 
@@ -14,19 +14,21 @@ from sqlparser import parse_query
 def make_binary_op(v):
     return f'{{l}} {v} {{r}}'
 
+
 _BINARY_OPS = {
     '=': '==',
-    'AND':'&',
-    'OR':'|',
+    'AND': '&',
+    'OR': '|',
     '<>': '!=',
-    **{k:k for k in ['<=','>=',*'+/*-%<>']}
+    **{k: k for k in ['<=', '>=', *'+/*-%<>']}
 }
 
 CONVERT_OP = {
     'NOT': '~{r}',
+    'IN': '{l}.isin({r})',
     'LIKE': "{l}.str.match(({r}).replace('%','.*'))",
     'REGEXP': "{l}.str.match({r})",
-    ** {k: make_binary_op(v) for k,v in _BINARY_OPS.items()}
+    ** {k: make_binary_op(v) for k, v in _BINARY_OPS.items()}
 }
 
 
@@ -101,18 +103,12 @@ class ExpressionAndAlias(BaseExpression):
     def name(self):
         return self.alias
 
-    # def get_exposed_name(self):
-    #     return self.alias or self.expression.name
-
     def __iter__(self):
         yield self.alias
         yield self.expression
 
     def __repr__(self):
         return f"<EA {self.alias}, {self.expression}>"
-
-    # def __str__(self):
-    #     return f"{self.alias} AS {self.expression}"
 
 
 JOIN_TYPES = {
@@ -134,15 +130,9 @@ class AbstractDataFrame:
     def render_column_name(self, col: ColumnName, frame_variable_name: Optional[str] = None):
         pass
 
-    def render_function(self, name: str, parameters: List[BaseExpression]| Distinct):
+    def render_function(self, name: str, parameters: List[BaseExpression] | Distinct):
         fun = CONV_FUNCTION.get(name, name)
         is_distinct = False
-        # if isinstance(parameters, Distinct):
-        #     parameters = parameters.value
-        #     if fun == 'count':
-        #         return f"pd.concat([{','.join(map(self.render, parameters))}], axis=1).drop_duplicates().size"
-        #     else:
-        #         raise NotImplementedError()
         if callable(fun):
             return fun(self, parameters)
         else:
@@ -153,35 +143,29 @@ class AbstractDataFrame:
                 return f"{fun}({','.join(map(self.render, parameters))})"
 
     def render(self, expression: BaseExpression) -> str:
-        # namespace = namespace or self.name
         match expression:
             case Operation(left=left, right=right, value=op):
                 l = self.render(left)
                 r = self.render(right)
                 return CONVERT_OP[op.upper()].format(l=l, r=r)
-                # return f"{l} {o} {r}"
             case ColumnName():
                 return self.render_deref_column(expression)
             case Function(name=name, parameters=parameters):
                 return self.render_function(name, parameters)
-            # case AliasedExpression(alias=alias, expression=expr):
-            #     return self.render(expr)
             case Literal():
                 return str(expression)
-            # case ExpressionAndAlias(alias=alias, expression=expr):
-            #     return self.render(expr)
             case Expression(items=items):
                 result = []
                 for item in items:
                     match item:
                         case BooleanOperator(value=value):
-                            result.append(CONVERT_OP[value.upper()].format(r='', l=''))
-                            # result.append(CONVERT_OP.get(value.upper(), value))
+                            result.append(
+                                CONVERT_OP[value.upper()].format(r='', l=''))
                         case _ if item is not None:
                             result.extend(['(', self.render(item), ')'])
                 return ' '.join(result)
-            # case [token]:
-            #     return self.render(token)
+            case ValueList(values=values):
+                return f"({','.join(self.render(i) for i in values)})"
             case _:
                 raise ValueError()
 
@@ -205,7 +189,7 @@ class JoinDataFrame(AbstractDataFrame):
     def get_frame_variable(self):
         return self.variable_name
 
-    def _generate_cross_join(self, code):
+    def _generate_cross_join(self, code: Code):
         code << "pd.merge(" << self.df1.get_frame_variable(
         ) << '.assign(__crossjoin=0),'
         code << self.df2.get_frame_variable() << '.assign(__crossjoin=0),'
@@ -214,7 +198,7 @@ class JoinDataFrame(AbstractDataFrame):
         code << f'suffixes=("_{self.df1.get_frame_variable()}","_{self.df2.get_frame_variable()}"),',
         code << ')' << NL
 
-    def generate_code_body(self, code):
+    def generate_code_body(self, code: Code):
         if self.jointype == 'cross':
             return self._generate_cross_join(code)
         else:
@@ -239,7 +223,7 @@ class SimpleDataFrame(AbstractDataFrame):
 
     def render_column_name(self, col: ColumnName):
         return col.name
-        
+
     def render_deref_column(self, column_name: ColumnName):
         return f"{self.get_frame_variable()}['{self.render_column_name(column_name)}']"
 
@@ -321,10 +305,6 @@ class DataFrame(AbstractDataFrame):
             self.materialized.append(ea := ExpressionAndAlias(col, expr))
             return ColumnName(ea.alias)
 
-    # def set_alias(self, colname:str, alias:str):
-    #     if colname != alias and alias is not None:
-    #         self.rename(colname, alias)
-
     def rename(self, old: str, new: str):
         if new is None:
             raise ValueError()
@@ -400,7 +380,7 @@ class DataFrame(AbstractDataFrame):
             case _:
                 return str(name)
 
-    def generate_code_body(self, code) -> Code:
+    def generate_code_body(self, code: Code) -> Code:
         code = code or Code()
         code << '(' << self.get_frame_variable() << NL
         if self.materialized:
@@ -438,7 +418,7 @@ class DataFrame(AbstractDataFrame):
             else:
                 code << ".pipe(lambda df: df.set_axis(['_'.join(i for i in x if i) for x in df.columns], axis='columns'))"
                 code << NL << INDENT
-        if self.select and not (len(self.select) == 1 and self.select[0] == Wildcard()):
+        if self.select and not (len(self.select) == 1 and isinstance(self.select[0], Wildcard)):
             code << '.pipe(lambda _df: _df[['
             for ae in self.select:
                 if isinstance(ae, Wildcard):
@@ -462,7 +442,7 @@ class DataFrame(AbstractDataFrame):
         return code
 
 
-def make_dataframe(query: Query| AbstractDataFrame, from_: AbstractDataFrame):
+def make_dataframe(query: Query | AbstractDataFrame, from_: AbstractDataFrame):
     # alias = exposed_name or af.get_alias() or query.get_frame_variable()
     if isinstance(query, Query):
         # (query.get_frame_variable())
@@ -481,7 +461,7 @@ def make_dataframe(query: Query| AbstractDataFrame, from_: AbstractDataFrame):
 
 
 def _code_gen(pq: Query, code: Code, exposed_name, namespace) -> Code:
-
+    """generate python code from a query or a sub query"""
     for af in pq.sub_queries():
         _code_gen(af.get_from_(), code, af.get_exposed_name(), namespace)
     af = SimpleDataFrame(pq.from_[0].get_aliased_from().get_exposed_name())

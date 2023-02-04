@@ -269,9 +269,16 @@ class BooleanOperator:
     def __str__(self):
         return self.value
 
+
 @dataclass
 class Distinct(BaseExpression):
     value: List[BaseExpression]
+
+
+@dataclass
+class ValueList(BaseExpression):
+    values: List[BaseExpression]
+
 
 BOOLEAN_OP_PATTERN = pypama.build_pattern((K.AND | K.OR | K.NOT).capture())
 
@@ -321,7 +328,7 @@ def get_function_parameters(tokens):
             sqlparse.sql.Token() as distinct,
             (sqlparse.sql.Identifier() | sqlparse.sql.Operation() | sqlparse.sql.Function()) as expr,
             sqlparse.sql.Token() as p2
-        ] if T.Punctuation(p1) and T.Punctuation(p2) and T.Keyword(distinct) and distinct.value.lower()=='distinct':
+        ] if T.Punctuation(p1) and T.Punctuation(p2) and T.Keyword(distinct) and distinct.value.lower() == 'distinct':
             return Distinct([read_expression([expr])])
     raise ValueError(tokens)
 
@@ -348,6 +355,8 @@ def read_expression(expr: List[sqlparse.sql.Token], cls: type = Expression) -> B
             left, op, right = pypama.build_pattern(
                 T.Operator.capture()).split(remove(expr[0].tokens))
             return Comparison(read_expression(left), read_expression(right), op[0].value)
+        case [sqlparse.sql.IdentifierList() as identifiers]:
+            return ValueList(values=[read_expression([i]) for i in identifiers.get_identifiers()])
         case _:
             assert len(expr) > 1
             s = iter(BOOLEAN_OP_PATTERN.split(expr))
@@ -483,14 +492,14 @@ WITH_PATTERN = pypama.build_pattern(
 
 def read_with_clause(tokens: List[sqlparse.sql.Token]) -> List[AliasedFrom]:
     result = []
-    assert len(tokens)==1
+    assert len(tokens) == 1
     token, = tokens
     if I.Identifier(token):
         result.append(read_cte(token))
     elif I.IdentifierList(token):
         for t in token.get_identifiers():
             result.append(read_cte(t))
-        
+
     return result
 
 
@@ -668,7 +677,7 @@ def read_where(token: List[sqlparse.sql.Token]) -> Expression:
 QUERY_PATTERN = pypama.build_pattern(
     (T.Keyword.CTE + (I.Identifier | I.IdentifierList).capture('CTE')).opt(),
     T.Keyword.DML,
-    (T.Keyword & (lambda t:t.value.lower()=='distinct')).opt().capture('DISTINCT'),
+    (T.Keyword & (lambda t: t.value.lower() == 'distinct')).opt().capture('DISTINCT'),
     (I.IdentifierList | I.Identifier | T.Wildcard |
      I.Function | I.Comparison | I.Operation).star().capture('SELECT'),
     K.FROM,
@@ -760,7 +769,8 @@ class Query(QueryComponent):
         builder << 'SELECT' << self.select << 'FROM' << self.from_
         builder << (self.where and StrBuilder('WHERE', self.where))
         builder << (self.groupby and StrBuilder('GROUP BY', self.groupby))
-        builder << (self.orderby and StrBuilder('ORDER BY', StrBuilder(*self.orderby)))
+        builder << (self.orderby and StrBuilder(
+            'ORDER BY', StrBuilder(*self.orderby)))
         builder << (self.having and StrBuilder('HAVING', self.having))
         builder << (self.limit and StrBuilder('LIMIT', self.limit))
         return builder
@@ -803,4 +813,3 @@ def read_query(tokens: List[sqlparse.sql.Token]) -> Query:
 def parse_query(s: str) -> Query:
     tokens = sqlparse.parse(s)[0].tokens
     return read_query(tokens)
-

@@ -19,7 +19,19 @@ For complex transformations, SQL is more expressive than pandas. This tool provi
 
 Usage
 -----
+python sqldf.py
+>>> enter your query
+[output is the equivalent python code with pandas]
 
+Current status of implementation
+--------------------------------
+The SQL dialect is sqlite, with the addition of lists and sets.
+ * To explode a list, use an ARRAY JOIN
+ * manages WITH clause, subqueries, and of course group by, select, where, order by
+ * What's known to miss: EXISTS, HAVING, Window functions, VALUES, many scalar and grouping function and probably more. Some of them are easy to implement
+ * expressions containing agregation functions
+ * dotted names (table.column) are limited to the selection of the table in a join, when there are several columns with the same name. Otherwise, remove the table prefix (that's due to the implementation of pandas.merge)
+ * it's not possible to use a column of a table inside a subquery
 
 License
 -------

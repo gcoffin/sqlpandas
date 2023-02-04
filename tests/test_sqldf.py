@@ -1,11 +1,11 @@
+from sqldf import parse_query, Code, DataFrame, code_gen
 import sys
 import math
 import numpy as np
 import pytest
-
+import re
 print(sys.path)
 
-from sqldf import parse_query, Code, DataFrame, code_gen
 
 HEADER = ['id', 'name', 'gender', 'height', 'town']
 DATA = [
@@ -39,8 +39,10 @@ df2.to_sql('df2', con, index=False)
 resql = pd.read_sql('''{q} ''', con=con)
 """
 
+# these queries are tested to run exactly as sqlite would
 QUERIES = [
     """select distinct town from df""",
+    """select town from df where town in ('Paris', 'London')""",
     """select count(distinct town) from df""",
     """select count(1) from (select distinct town from df) as q""",
     """select town, height from df where town like '%ris'""",
@@ -66,8 +68,9 @@ QUERIES = [
     """with df1 as (select height from df),
         df2 as (select height from df)
         select df1.height,df2.height from df1
-        cross join df2 where df1.height>df2.height order by 1,2""" ,
-    # """select 2*count(distinct id) from df"""
+        cross join df2 where df1.height>df2.height order by 1,2""",
+    # """select 2*count(distinct id) from df""" #known to fail
+
 ]
 
 
@@ -130,9 +133,9 @@ QUERIES2 = [
     ("""with table1 as (select set(lower(town)) as t from df) select t from table1 array join t order by t""",
      [['lyon'], ['paris']]
      ),
-         ("""select town, length(height_range), slice(height_range,0,1), height_range
+    ("""select town, length(height_range), slice(height_range,0,1), height_range
          from (select town, list(height) as height_range from df group by 1) as q1""",
-        [['Lyon', 3, [165], [165, 162, 184]], ['Paris', 2, [182,], [182, 190]]]
+     [['Lyon', 3, [165], [165, 162, 184]], ['Paris', 2, [182,], [182, 190]]]
      ),
 ]
 
@@ -163,8 +166,17 @@ def test_query2(q, data):
         raise ValueError()
 
 
+def test_optim():
+    q = """select * from toto"""
+    code = Code()
+    s = str(code_gen(q, code, 'df'))
+    assert re.sub('[\n\t ]+', ' ', s).strip() == """df=(toto )"""
+
+
 if __name__ == "__main__":
     import instrument
+    if 0:
+        test_optim()
     if 1:
         for q in QUERIES:
             test_query(q)
